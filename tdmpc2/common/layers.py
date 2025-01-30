@@ -115,7 +115,61 @@ class NormedLinear(nn.Linear):
 			f"out_features={self.out_features}, "\
 			f"bias={self.bias is not None}{repr_dropout}, "\
 			f"act={self.act.__class__.__name__})"
+	
+########################################################################################
+# @torch.jit.script
+def compl_mul1d(a, b):
+    # (M, N, in_ch), (in_ch, out_ch, M) -> (M, N, out_channel)
+    return torch.einsum("mni,iom->mno", a, b)
 
+class SpectralConv1d(nn.Module):
+    def __init__(self, in_ch, out_ch, modes1):
+        super(SpectralConv1d, self).__init__()
+
+        """
+        1D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
+        """
+
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.modes1 = modes1
+
+        self.scale = (1 / (in_ch*out_ch))
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_ch, out_ch, self.modes1, 2, dtype=torch.float))
+
+    def forward(self, x):
+        T, N, C = x.shape
+        # Compute Fourier coeffcients up to factor of e^(- something constant)
+        with torch.cuda.amp.autocast(enabled=False):
+        # with torch.autocast(device_type='cuda', enabled=False):
+            x_ft = torch.fft.rfftn(x.float(), dim=[0])
+            # Multiply relevant Fourier modes
+            out_ft = compl_mul1d(x_ft[:self.modes1], torch.view_as_complex(self.weights1))
+            # Return to physical space
+            x = torch.fft.irfftn(out_ft, s=[T], dim=[0])
+        return x
+
+
+class FNO1DPolicy(nn.Module):
+
+    def __init__(self, latent_dim, action_dim, task_dim=0, modes=16):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.action_dim = action_dim
+        self.task_dim = task_dim
+        self.modes = modes
+        self.spectral_conv = SpectralConv1d(
+            in_ch=self.in_channels,
+            out_ch=self.out_channels,
+            modes1=self.modes
+        )
+
+    def forward(self, z):
+        action = self.spectral_conv(z)
+        action = torch.tanh(action)
+        return action
+########################################################################################
 
 def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
 	"""

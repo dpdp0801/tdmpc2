@@ -25,7 +25,14 @@ class WorldModel(nn.Module):
 		self._encoder = layers.enc(cfg)
 		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
-		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
+
+		self._pi = self._pi = layers.FNO1DPolicy(
+            latent_dim=cfg.latent_dim,
+            action_dim=cfg.action_dim,
+            task_dim=(cfg.task_dim if cfg.multitask else 0),
+            modes=16 
+        )
+
 		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
 		self.apply(init.weight_init)
 		init.zero_([self._reward[-1].weight, self._Qs.params["2", "weight"]])
@@ -135,38 +142,20 @@ class WorldModel(nn.Module):
 		if self.cfg.multitask:
 			z = self.task_emb(z, task)
 
-		# Gaussian policy prior
-		mean, log_std = self._pi(z).chunk(2, dim=-1)
-		log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
-		eps = torch.randn_like(mean)
+		z_time = z.unsqueeze(0)
+		
+		action = self.pi(z_time)
+		action = action[0]
 
-		if self.cfg.multitask: # Mask out unused action dimensions
-			mean = mean * self._action_masks[task]
-			log_std = log_std * self._action_masks[task]
-			eps = eps * self._action_masks[task]
-			action_dims = self._action_masks.sum(-1)[task].unsqueeze(-1)
-		else: # No masking
-			action_dims = None
 
-		log_prob = math.gaussian_logprob(eps, log_std)
-
-		# Scale log probability by action dimensions
-		size = eps.shape[-1] if action_dims is None else action_dims
-		scaled_log_prob = log_prob * size
-
-		# Reparameterization trick
-		action = mean + eps * log_std.exp()
-		mean, action, log_prob = math.squash(mean, action, log_prob)
-
-		entropy_scale = scaled_log_prob / (log_prob + 1e-8)
-		info = TensorDict({
-			"mean": mean,
-			"log_std": log_std,
-			"action_prob": 1.,
-			"entropy": -log_prob,
-			"scaled_entropy": -log_prob * entropy_scale,
-		})
-		return action, info
+		# info = TensorDict({
+		# 	"mean": mean,
+		# 	"log_std": log_std,
+		# 	"action_prob": 1.,
+		# 	"entropy": -log_prob,
+		# 	"scaled_entropy": -log_prob * entropy_scale,
+		# })
+		return action #, info
 
 	def Q(self, z, a, task, return_type='min', target=False, detach=False):
 		"""
