@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import from_modules
 from copy import deepcopy
+from neuralop.models import FNO1d
+
 
 class Ensemble(nn.Module):
 	"""
@@ -115,61 +117,46 @@ class NormedLinear(nn.Linear):
 			f"out_features={self.out_features}, "\
 			f"bias={self.bias is not None}{repr_dropout}, "\
 			f"act={self.act.__class__.__name__})"
-	
-########################################################################################
-# @torch.jit.script
-def compl_mul1d(a, b):
-    # (M, N, in_ch), (in_ch, out_ch, M) -> (M, N, out_channel)
-    return torch.einsum("mni,iom->mno", a, b)
 
-class SpectralConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, modes1):
-        super(SpectralConv1d, self).__init__()
-
-        """
-        1D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
-        """
-
-        self.in_ch = in_ch
-        self.out_ch = out_ch
-        self.modes1 = modes1
-
-        self.scale = (1 / (in_ch*out_ch))
-        self.weights1 = nn.Parameter(
-            self.scale * torch.rand(in_ch, out_ch, self.modes1, 2, dtype=torch.float))
-
-    def forward(self, x):
-        T, N, C = x.shape
-        # Compute Fourier coeffcients up to factor of e^(- something constant)
-        with torch.cuda.amp.autocast(enabled=False):
-        # with torch.autocast(device_type='cuda', enabled=False):
-            x_ft = torch.fft.rfftn(x.float(), dim=[0])
-            # Multiply relevant Fourier modes
-            out_ft = compl_mul1d(x_ft[:self.modes1], torch.view_as_complex(self.weights1))
-            # Return to physical space
-            x = torch.fft.irfftn(out_ft, s=[T], dim=[0])
-        return x
+#################################################################
+class FNO1dPolicy(nn.Module):
 
 
-class FNO1DPolicy(nn.Module):
-
-    def __init__(self, latent_dim, action_dim, task_dim=0, modes=16):
+    def __init__(self, cfg):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.action_dim = action_dim
-        self.task_dim = task_dim
-        self.modes = modes
-        self.spectral_conv = SpectralConv1d(
-            in_ch=self.in_channels,
-            out_ch=self.out_channels,
-            modes1=self.modes
-        )
+        in_channels = cfg.latent_dim + cfg.task_dim + 1
+        out_channels = 2 * cfg.action_dim
 
-    def forward(self, z):
-        action = self.spectral_conv(z)
-        action = torch.tanh(action)
-        return action
-########################################################################################
+        self.fno = FNO1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            modes_height=16,
+            hidden_channels=128,
+            n_layers=4,
+			)
+
+        # store config 
+        self.cfg = cfg
+
+    def forward(self, time_embed, z_embed):
+        """
+        time_embed: [time, batch, 1]
+        z_embed:    [time, batch, latent_dim + task_dim]
+        Returns:    [time, batch, 2 * action_dim]
+        """
+
+        x = torch.cat([time_embed, z_embed], dim=-1)
+
+        # FNO in neuralop is typically [batch, in_channels, spatial_dim]
+        x = x.permute(1, 2, 0)  # shape: [batch, in_channels, time]
+
+        # Apply FNO
+        out = self.fno(x)
+
+        #  back to [time, batch, out_channels]
+        out = out.permute(2, 0, 1)
+        return out
+################################################################################
 
 def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
 	"""
@@ -215,3 +202,58 @@ def enc(cfg, out={}):
 		else:
 			raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
 	return nn.ModuleDict(out)
+
+
+def api_model_conversion(target_state_dict, source_state_dict):
+	"""
+	Converts a checkpoint from our old API to the new torch.compile compatible API.
+	"""
+	# check whether checkpoint is already in the new format
+	if "_detach_Qs_params.0.weight" in source_state_dict:
+		return source_state_dict
+
+	name_map = ['weight', 'bias', 'ln.weight', 'ln.bias']
+	new_state_dict = dict()
+
+	# rename keys
+	for key, val in list(source_state_dict.items()):
+		if key.startswith('_Qs.'):
+			num = key[len('_Qs.params.'):]
+			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
+			new_total_key = "_Qs.params." + new_key
+			del source_state_dict[key]
+			new_state_dict[new_total_key] = val
+			new_total_key = "_detach_Qs_params." + new_key
+			new_state_dict[new_total_key] = val
+		elif key.startswith('_target_Qs.'):
+			num = key[len('_target_Qs.params.'):]
+			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
+			new_total_key = "_target_Qs_params." + new_key
+			del source_state_dict[key]
+			new_state_dict[new_total_key] = val
+
+	# add batch_size and device from target_state_dict to new_state_dict
+	for prefix in ('_Qs.', '_detach_Qs_', '_target_Qs_'):
+		for key in ('__batch_size', '__device'):
+			new_key = prefix + 'params.' + key
+			new_state_dict[new_key] = target_state_dict[new_key]
+
+	# check that every key in new_state_dict is in target_state_dict
+	for key in new_state_dict.keys():
+		assert key in target_state_dict, f"key {key} not in target_state_dict"
+	# check that all Qs keys in target_state_dict are in new_state_dict
+	for key in target_state_dict.keys():
+		if 'Qs' in key:
+			assert key in new_state_dict, f"key {key} not in new_state_dict"
+	# check that source_state_dict contains no Qs keys
+	for key in source_state_dict.keys():
+		assert 'Qs' not in key, f"key {key} contains 'Qs'"
+
+	# copy log_std_min and log_std_max from target_state_dict to new_state_dict
+	new_state_dict['log_std_min'] = target_state_dict['log_std_min']
+	new_state_dict['log_std_dif'] = target_state_dict['log_std_dif']
+
+	# copy new_state_dict to source_state_dict
+	source_state_dict.update(new_state_dict)
+
+	return source_state_dict

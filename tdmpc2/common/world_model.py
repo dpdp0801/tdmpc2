@@ -7,7 +7,6 @@ from common import layers, math, init
 from tensordict import TensorDict
 from tensordict.nn import TensorDictParams
 
-
 class WorldModel(nn.Module):
 	"""
 	TD-MPC2 implicit world model architecture.
@@ -26,14 +25,13 @@ class WorldModel(nn.Module):
 		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
 
-		self._pi = self._pi = layers.FNO1DPolicy(
-            latent_dim=cfg.latent_dim,
-            action_dim=cfg.action_dim,
-            task_dim=(cfg.task_dim if cfg.multitask else 0),
-            modes=16 
-        )
 
-		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
+		self._pi = layers.FNO1dPolicy(cfg)
+
+		self._Qs = layers.Ensemble([
+			layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 
+			  2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) 
+			  for _ in range(cfg.num_q)])
 		self.apply(init.weight_init)
 		init.zero_([self._reward[-1].weight, self._Qs.params["2", "weight"]])
 
@@ -132,7 +130,63 @@ class WorldModel(nn.Module):
 			z = self.task_emb(z, task)
 		z = torch.cat([z, a], dim=-1)
 		return self._reward(z)
+	
+	def pi_trajectory(self, z, task=None):
+		"""
+		produce entire horizon of actions in one forward pass of the FNO.
 
+		returns
+			actions: [H, B, action_dim]
+			means:   [H, B, action_dim]
+			log_stds:[H, B, action_dim]
+
+		"""
+		H = self.cfg.horizon
+		B = z.shape[0]
+
+		# If multi-task, embed the task
+		if self.cfg.multitask:
+			z = self.task_emb(z, task)
+
+		z_embed = z.unsqueeze(0).expand(H, B, -1)
+		time_embed = torch.linspace(0, 1, H, device=z.device).view(H, 1, 1).expand(-1, B, -1)
+
+		out = self._pi(time_embed, z_embed)
+		mean, log_std = out.chunk(2, dim=-1)  # each has [H, B, action_dim]
+
+		log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
+
+		eps = torch.randn_like(mean)
+
+
+		if self.cfg.multitask: # Mask out unused action dimensions
+			mean = mean * self._action_masks[task]
+			log_std = log_std * self._action_masks[task]
+			eps = eps * self._action_masks[task]
+			action_dims = self._action_masks.sum(-1)[task].unsqueeze(-1)
+		else: # No masking
+			action_dims = None
+
+		log_prob = math.gaussian_logprob(eps, log_std)
+
+		# Scale log probability by action dimensions
+		size = eps.shape[-1] if action_dims is None else action_dims
+		scaled_log_prob = log_prob * size
+
+		# Reparameterization trick
+		action = mean + eps * log_std.exp()
+		mean, action, log_prob = math.squash(mean, action, log_prob)
+
+		entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+		info = TensorDict({
+			"mean": mean,
+			"log_std": log_std,
+			"action_prob": 1.,
+			"entropy": -log_prob,
+			"scaled_entropy": -log_prob * entropy_scale,
+		})
+		return action, info
+	
 	def pi(self, z, task):
 		"""
 		Samples an action from the policy prior.
@@ -142,20 +196,47 @@ class WorldModel(nn.Module):
 		if self.cfg.multitask:
 			z = self.task_emb(z, task)
 
-		z_time = z.unsqueeze(0)
+		# Gaussian policy prior
 		
-		action = self.pi(z_time)
-		action = action[0]
+		z = z.unsqueeze(0)
+		T = z.shape[0]
+		B = z.shape[1]
+		time_embed = torch.linspace(0, 1, T, device=z.device).view(T, 1, 1).expand(-1, B, -1)
+		out = self._pi(time_embed, z)
+		out = out.squeeze(0)
+		mean, log_std = out.chunk(2, dim=-1)
 
 
-		# info = TensorDict({
-		# 	"mean": mean,
-		# 	"log_std": log_std,
-		# 	"action_prob": 1.,
-		# 	"entropy": -log_prob,
-		# 	"scaled_entropy": -log_prob * entropy_scale,
-		# })
-		return action #, info
+		log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
+		eps = torch.randn_like(mean)
+
+		if self.cfg.multitask: # Mask out unused action dimensions
+			mean = mean * self._action_masks[task]
+			log_std = log_std * self._action_masks[task]
+			eps = eps * self._action_masks[task]
+			action_dims = self._action_masks.sum(-1)[task].unsqueeze(-1)
+		else: # No masking
+			action_dims = None
+
+		log_prob = math.gaussian_logprob(eps, log_std)
+
+		# Scale log probability by action dimensions
+		size = eps.shape[-1] if action_dims is None else action_dims
+		scaled_log_prob = log_prob * size
+
+		# Reparameterization trick
+		action = mean + eps * log_std.exp()
+		mean, action, log_prob = math.squash(mean, action, log_prob)
+
+		entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+		info = TensorDict({
+			"mean": mean,
+			"log_std": log_std,
+			"action_prob": 1.,
+			"entropy": -log_prob,
+			"scaled_entropy": -log_prob * entropy_scale,
+		})
+		return action, info
 
 	def Q(self, z, a, task, return_type='min', target=False, detach=False):
 		"""

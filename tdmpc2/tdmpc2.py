@@ -173,14 +173,17 @@ class TDMPC2(torch.nn.Module):
 			torch.Tensor: Action to take in the environment.
 		"""
 		# Sample policy trajectories
+
 		z = self.model.encode(obs, task)
 		if self.cfg.num_pi_trajs > 0:
-			pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
-			_z = z.repeat(self.cfg.num_pi_trajs, 1)
-			for t in range(self.cfg.horizon-1):
-				pi_actions[t], _ = self.model.pi(_z, task)
-				_z = self.model.next(_z, pi_actions[t], task)
-			pi_actions[-1], _ = self.model.pi(_z, task)
+		# 	pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
+		# 	_z = z.repeat(self.cfg.num_pi_trajs, 1)
+		# 	for t in range(self.cfg.horizon-1):
+		# 		pi_actions[t], _ = self.model.pi(_z, task)
+		# 		_z = self.model.next(_z, pi_actions[t], task)
+		# 	pi_actions[-1], _ = self.model.pi(_z, task)
+			_z = z.repeat(self.cfg.num_pi_trajs, 1)  # shape: [num_pi_trajs, latent_dim]
+			pi_actions, _, _ = self.model.pi_trajectory(_z, task=task)  # shape: [H, num_pi_trajs, action_dim]
 
 		# Initialize state and parameters
 		z = z.repeat(self.cfg.num_samples, 1)
